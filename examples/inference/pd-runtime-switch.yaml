@@ -1,0 +1,307 @@
+# Example: PD-disaggregated inference with a runtime-switchable engine pool (v1alpha2)
+#
+# Extends pd-disagg-standalone.yaml with a fourth role whose Pods can change
+# serving role at runtime, using SGLang's runtime prefill<->decode switching
+# (https://github.com/sgl-project/sglang/pull/28403).
+#
+# Architecture:
+#   - router:      traffic entry, routes by serving role
+#   - prefill:     fixed prefill engine, never switches
+#   - decode:      fixed decode engine, never switches
+#   - pdmix-pool:  switchable pool; each Pod can become prefill or decode live
+#
+# The ownership contract:
+#   rbg.workloads.x-k8s.io/role-name is topology identity -- RBG owns it and it
+#   never changes. inference.workload.x-k8s.io/pd-role is serving identity --
+#   an external switch service owns it and patches it on live Pods. RBG carries
+#   it as an ordinary label and never reverts it.
+#
+#   The runtime label MUST be declared in standalonePattern.template.metadata.
+#   spec.roles[].labels does not reach Pods: it is applied to the RoleInstanceSet
+#   and RoleInstance objects only.
+#
+# Why the pool starts as "unassigned":
+#   The engine still launches with a concrete --disaggregation-mode; "unassigned"
+#   is a routing state, not an engine mode. The router only selects Pods labelled
+#   prefill or decode, so a freshly created or recreated Pod takes no traffic
+#   until the switch service assigns it a role after warmup. New Pods are
+#   therefore safe by default.
+#
+# Prerequisites:
+#   - SGLang image with runtime role switching (lmsysorg/sglang, build carrying
+#     sgl-project/sglang#28403) and sglang-router
+#   - GPU nodes with CUDA support
+#   - A KV transfer backend that implements role switching (mori or mooncake in
+#     the upstream PR); see the PR for the current backend matrix
+#   - An external switch service to drain traffic, call POST /pd_role_switch,
+#     and relabel the Pod. That service is out of scope for RBG.
+
+---
+apiVersion: workloads.x-k8s.io/v1alpha2
+kind: RoleBasedGroup
+metadata:
+  name: sglang-pd-runtime-switch
+  labels:
+    app: sglang-runtime-switch
+    deployment-type: pd-disaggregated
+spec:
+  roles:
+    # Fixed prefill engine. Its serving role never changes, so the label is
+    # simply declared in the template and left alone.
+    - name: prefill
+      replicas: 1
+      rolloutStrategy:
+        type: RollingUpdate
+        rollingUpdate:
+          type: InPlaceIfPossible
+          maxUnavailable: 1
+      standalonePattern:
+        template:
+          metadata:
+            labels:
+              app: sglang-runtime-switch
+              inference.workload.x-k8s.io/pd-role: prefill
+          spec:
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 30Gi
+            containers:
+              - name: prefill
+                image: lmsysorg/sglang:v0.5.9
+                command:
+                  - python3
+                  - -m
+                  - sglang.launch_server
+                  - --model-path
+                  - "Qwen/Qwen3-0.6B"
+                  - --host
+                  - "0.0.0.0"
+                  - --port
+                  - "8000"
+                  - --disaggregation-mode
+                  - "prefill"
+                  - --tp-size
+                  - "1"
+                ports:
+                  - name: http
+                    containerPort: 8000
+                resources:
+                  requests:
+                    cpu: "4"
+                    memory: "8Gi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "8"
+                    memory: "16Gi"
+                    nvidia.com/gpu: "1"
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  initialDelaySeconds: 60
+                  periodSeconds: 10
+
+    # Fixed decode engine.
+    - name: decode
+      replicas: 1
+      rolloutStrategy:
+        type: RollingUpdate
+        rollingUpdate:
+          type: InPlaceIfPossible
+          maxUnavailable: 1
+      standalonePattern:
+        template:
+          metadata:
+            labels:
+              app: sglang-runtime-switch
+              inference.workload.x-k8s.io/pd-role: decode
+          spec:
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 30Gi
+            containers:
+              - name: decode
+                image: lmsysorg/sglang:v0.5.9
+                command:
+                  - python3
+                  - -m
+                  - sglang.launch_server
+                  - --model-path
+                  - "Qwen/Qwen3-0.6B"
+                  - --host
+                  - "0.0.0.0"
+                  - --port
+                  - "8000"
+                  - --disaggregation-mode
+                  - "decode"
+                  - --tp-size
+                  - "1"
+                ports:
+                  - name: http
+                    containerPort: 8000
+                resources:
+                  requests:
+                    cpu: "4"
+                    memory: "8Gi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "8"
+                    memory: "16Gi"
+                    nvidia.com/gpu: "1"
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  initialDelaySeconds: 60
+                  periodSeconds: 10
+
+    # Switchable pool. --enable-pd-role-switch exposes POST /pd_role_switch on
+    # each engine. The template label is only the initial value: once a Pod
+    # exists, the switch service owns the live value.
+    #
+    # Do not edit this label in the spec at runtime. An in-place update builds
+    # its metadata patch from the old/new revision diff, so changing the
+    # template value would overwrite the live value on the next rollout.
+    - name: pdmix-pool
+      replicas: 2
+      rolloutStrategy:
+        type: RollingUpdate
+        rollingUpdate:
+          type: InPlaceIfPossible
+          maxUnavailable: 1
+      standalonePattern:
+        template:
+          metadata:
+            labels:
+              app: sglang-runtime-switch
+              inference.workload.x-k8s.io/pd-role: unassigned
+          spec:
+            volumes:
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 30Gi
+            containers:
+              - name: engine
+                image: lmsysorg/sglang:v0.5.9
+                command:
+                  - python3
+                  - -m
+                  - sglang.launch_server
+                  - --model-path
+                  - "Qwen/Qwen3-0.6B"
+                  - --host
+                  - "0.0.0.0"
+                  - --port
+                  - "8000"
+                  - --disaggregation-mode
+                  - "decode"
+                  - --enable-pd-role-switch
+                  - --tp-size
+                  - "1"
+                ports:
+                  - name: http
+                    containerPort: 8000
+                resources:
+                  requests:
+                    cpu: "4"
+                    memory: "8Gi"
+                    nvidia.com/gpu: "1"
+                  limits:
+                    cpu: "8"
+                    memory: "16Gi"
+                    nvidia.com/gpu: "1"
+                volumeMounts:
+                  - name: dshm
+                    mountPath: /dev/shm
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  initialDelaySeconds: 60
+                  periodSeconds: 10
+
+    # Router. Backend discovery is owned by the switch service / router, not by
+    # RBG. The two Services below are what makes routing follow the runtime
+    # label: relabelling a Pod moves it between their endpoint sets.
+    - name: router
+      replicas: 1
+      standalonePattern:
+        template:
+          metadata:
+            labels:
+              app: sglang-runtime-switch
+          spec:
+            containers:
+              - name: router
+                image: lmsysorg/sglang-router:v0.2.4
+                command:
+                  - python3
+                  - -m
+                  - sglang_router.launch_router
+                  - --pd-disaggregation
+                  - --prefill
+                  - "http://pd-prefill:8000"
+                  - --decode
+                  - "http://pd-decode:8000"
+                  - --host
+                  - "0.0.0.0"
+                  - --port
+                  - "8000"
+                ports:
+                  - name: http
+                    containerPort: 8000
+                resources:
+                  requests:
+                    cpu: "2"
+                    memory: "4Gi"
+                  limits:
+                    cpu: "4"
+                    memory: "8Gi"
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+
+---
+# Serving-role Services. These select on the runtime label, so a Pod joins or
+# leaves the backend set as soon as the switch service patches its label --
+# no RBG involvement and no Pod restart.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-prefill
+spec:
+  selector:
+    app: sglang-runtime-switch
+    inference.workload.x-k8s.io/pd-role: prefill
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-decode
+spec:
+  selector:
+    app: sglang-runtime-switch
+    inference.workload.x-k8s.io/pd-role: decode
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

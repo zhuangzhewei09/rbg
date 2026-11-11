@@ -25,6 +25,7 @@
   - [Revision](features/revision.md)
   - [Monitoring](features/monitoring.md)
   - [Instance](features/instance.md)
+  - [Runtime Labels](features/runtime-labels.md)
 - Reference
   - [Labels, Annotations and Environment Variables](reference/variables.md)
   - [RoleBasedGroup API](reference/api.md)
@@ -52,6 +53,7 @@
     - [Aggregated Leader-Worker](../examples/inference/agg-leader-worker.yaml)
     - [PD-Disaggregated Standalone](../examples/inference/pd-disagg-standalone.yaml)
     - [PD-Disaggregated Leader-Worker](../examples/inference/pd-disagg-leader-worker.yaml)
+    - [PD Runtime Role Switching](../examples/inference/pd-runtime-switch.yaml)
 
   - Ecosystem Integration
     - [Dynamo Integration](../examples/inference/ecosystem/dynamo/)
